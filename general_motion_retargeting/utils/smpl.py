@@ -102,6 +102,77 @@ def load_gvhmr_pred_file(gvhmr_pred_file, smplx_body_model_path):
     return smplx_data, body_model, smplx_output, human_height
 
 
+def load_emage_npz_file(emage_npz_file, smplx_body_model_path):
+    """
+    Load PantoMatrix/EMAGE output npz and convert to GMR SMPL-X format.
+    EMAGE npz keys: poses (N, 165), trans (N, 3), betas (300,), gender, mocap_frame_rate, ...
+    SMPL-X pose layout: root_orient(3) + body_pose(63) + jaw(3) + leye(3) + reye(3) + hands(90) = 165.
+    """
+    emage_data = np.load(emage_npz_file, allow_pickle=True)
+    poses = emage_data["poses"]  # (N, 165)
+    trans = emage_data["trans"]  # (N, 3)
+    betas_full = emage_data["betas"]  # (300,) for SMPL-X+FLAME
+    gender = str(emage_data.get("gender", "neutral"))
+    mocap_frame_rate = emage_data["mocap_frame_rate"]
+    if hasattr(mocap_frame_rate, "item"):
+        mocap_frame_rate = np.int64(mocap_frame_rate.item())
+    else:
+        mocap_frame_rate = np.int64(mocap_frame_rate)
+
+    assert poses.shape[1] == 165, f"EMAGE poses should be (N, 165), got {poses.shape}"
+    root_orient = np.asarray(poses[:, 0:3], dtype=np.float32)
+    pose_body = np.asarray(poses[:, 3:66], dtype=np.float32)  # 21 joints * 3 = 63
+    trans = np.asarray(trans, dtype=np.float32)
+
+    # EMAGE/BEAT 与 GVHMR 同为 Y-up，需转为 GMR/MuJoCo 的 Z-up，否则机器人会仰面倒地
+    rotation_matrix = np.array([[1, 0, 0], [0, 0, -1], [0, 1, 0]], dtype=np.float32)
+    trans = trans @ rotation_matrix.T  # (N, 3)
+    for i in range(root_orient.shape[0]):
+        R_root = R.from_rotvec(root_orient[i]).as_matrix()
+        R_new = rotation_matrix @ R_root
+        root_orient[i] = R.from_matrix(R_new).as_rotvec()
+
+    body_model = smplx.create(
+        smplx_body_model_path,
+        "smplx",
+        gender=gender,
+        use_pca=False,
+    )
+    # Match betas length to this model's shapedirs (may be 10, 16, 26, 36 depending on asset)
+    model_num_betas = body_model.shapedirs.shape[-1]
+    betas = np.asarray(betas_full[:model_num_betas], dtype=np.float32)
+    if len(betas) < model_num_betas:
+        betas = np.pad(betas, (0, model_num_betas - len(betas)), mode="constant", constant_values=0.0)
+
+    smplx_data = {
+        "root_orient": root_orient,
+        "pose_body": pose_body,
+        "trans": np.asarray(trans, dtype=np.float32),
+        "betas": betas,
+        "gender": np.array(gender),
+        "mocap_frame_rate": mocap_frame_rate,
+    }
+
+    num_frames = pose_body.shape[0]
+    smplx_output = body_model(
+        betas=torch.tensor(smplx_data["betas"]).float().view(1, -1),
+        global_orient=torch.tensor(smplx_data["root_orient"]).float(),
+        body_pose=torch.tensor(smplx_data["pose_body"]).float(),
+        transl=torch.tensor(smplx_data["trans"]).float(),
+        left_hand_pose=torch.zeros(num_frames, 45).float(),
+        right_hand_pose=torch.zeros(num_frames, 45).float(),
+        jaw_pose=torch.zeros(num_frames, 3).float(),
+        leye_pose=torch.zeros(num_frames, 3).float(),
+        reye_pose=torch.zeros(num_frames, 3).float(),
+        return_full_pose=True,
+    )
+    if len(smplx_data["betas"].shape) == 1:
+        human_height = 1.66 + 0.1 * smplx_data["betas"][0]
+    else:
+        human_height = 1.66 + 0.1 * smplx_data["betas"][0, 0]
+    return smplx_data, body_model, smplx_output, human_height
+
+
 def get_smplx_data(smplx_data, body_model, smplx_output, curr_frame):
     """
     Must return a dictionary with the following structure:
